@@ -56,6 +56,7 @@ if st.session_state.auth == "Admin":
                 if p >= 40: return "40-60% shelf life"
                 return "<40% shelf life"
             df['Bucket'] = df['Shelf_Pct'].apply(get_bucket)
+            
             c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (u_date.strftime('%Y-%m-%d'), u_chan))
             for _, row in df.iterrows():
                 c.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?,?,?)", 
@@ -66,50 +67,50 @@ if st.session_state.auth == "Admin":
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 
-# --- 5. DATA LOADING & PRE-PROCESSING ---
+# --- 5. DATA LOADING & CLEANING ---
 inv_df = pd.read_sql("SELECT * FROM inventory", conn)
 price_df = pd.read_sql("SELECT * FROM prices", conn)
 prices_dict = dict(zip(price_df.title, price_df.cost_price))
 
 if inv_df.empty:
-    st.info("👋 Welcome! Please log in as Admin and upload your first WMS CSV file.")
+    st.info("👋 Welcome! Admin needs to upload a CSV file to begin.")
     st.stop()
 
-# Convert strings to actual date objects
+# Convert to proper date objects
 inv_df['date'] = pd.to_datetime(inv_df['date']).dt.date
-inv_df['mfg_date_dt'] = pd.to_datetime(inv_df['mfg_date'], errors='coerce')
+inv_df['mfg_date_dt'] = pd.to_datetime(inv_df['mfg_date'], dayfirst=True, errors='coerce')
 inv_df['Mfg Month-Year'] = inv_df['mfg_date_dt'].dt.strftime('%b-%Y')
+
+# IMPORTANT: Find the absolute latest date of inventory uploaded
+latest_overall_date = inv_df['date'].max()
 
 # --- 6. FILTERS ---
 st.title("📊 Inventory Health & Valuation")
+st.subheader(f"🔍 Filters (Showing data based on last upload: {latest_overall_date})")
 
-st.subheader("🔍 Search & Filter")
 f_col1, f_col2, f_col3 = st.columns(3)
 
 with f_col1:
-    # Time Presets
-    today = datetime.now().date()
-    t_preset = st.selectbox("Quick Date Filter", ["Show All History", "Last 7 Days", "MTD", "Last 30 Days"])
-    if t_preset == "Last 7 Days": start_d = today - timedelta(days=7)
-    elif t_preset == "MTD": start_d = today.replace(day=1)
-    elif t_preset == "Last 30 Days": start_d = today - timedelta(days=30)
-    else: start_d = datetime(2000, 1, 1).date()
-    data_filtered = inv_df[inv_df['date'] >= start_d].copy()
+    # Filter the primary data based on the chosen snapshot date
+    # Defaults to the latest available day in the DB
+    view_date = st.selectbox("Select Inventory Snapshot Date", sorted(inv_df['date'].unique(), reverse=True))
+    data_filtered = inv_df[inv_df['date'] == view_date].copy()
 
 with f_col2:
-    # Item Name Filter
-    all_items = sorted(data_filtered['title'].unique())
-    selected_items = st.multiselect("Filter by Product Name:", options=all_items)
+    # Item Name Filter (Only shows items present in that day's data)
+    available_items = sorted(data_filtered['title'].unique())
+    selected_items = st.multiselect("Filter by Product Name:", options=available_items)
     if selected_items:
         data_filtered = data_filtered[data_filtered['title'].isin(selected_items)]
 
 with f_col3:
-    # Manufacturing Month-Year Filter
-    all_mfg_periods = sorted(data_filtered['Mfg Month-Year'].dropna().unique())
-    selected_mfg = st.multiselect("Filter by Mfg Month-Year:", options=all_mfg_periods)
+    # Mfg Month-Year Filter (Only picks dates present in THIS specific snapshot)
+    available_mfg = sorted(data_filtered['Mfg Month-Year'].dropna().unique())
+    selected_mfg = st.multiselect("Filter by Mfg Month-Year (of current stock):", options=available_mfg)
     if selected_mfg:
         data_filtered = data_filtered[data_filtered['Mfg Month-Year'].isin(selected_mfg)]
 
+# Logic for Valuation
 data_filtered['Cost'] = data_filtered['title'].map(prices_dict).fillna(0)
 data_filtered['Value'] = data_filtered['stock'] * data_filtered['Cost']
 
@@ -117,32 +118,24 @@ view_mode = st.radio("Display Data By:", ["Quantity (Units)", "Value (Rupees)"],
 metric = 'stock' if "Quantity" in view_mode else 'Value'
 
 # --- 7. CHARTS ---
-# A. Stacked Bar Chart: Date & Channel
-st.subheader(f"Inventory {view_mode} per Day (B2B vs B2C)")
-date_summary = data_filtered.groupby(['date', 'channel'])[metric].sum().reset_index()
-fig_trend = px.bar(date_summary, x='date', y=metric, color='channel', 
-                   barmode='stack', title="Daily Stock Split")
+# A. Stacked Bar Chart: Channel Split
+st.subheader(f"Inventory {view_mode} - B2B vs B2C")
+fig_trend = px.bar(data_filtered, x='title', y=metric, color='channel', 
+                   barmode='stack', title=f"Stock Breakdown for {view_date}")
 st.plotly_chart(fig_trend, use_container_width=True)
 
 c1, c2 = st.columns(2)
 with c1:
-    # B. Stacked Bar Chart: Item & Channel
-    st.subheader(f"Top 10 Items by {view_mode} (Stacked by Channel)")
-    item_chan_summary = data_filtered.groupby(['title', 'channel'])[metric].sum().reset_index()
-    # Get top 10 titles based on total metric
-    top_10_titles = data_filtered.groupby('title')[metric].sum().sort_values(ascending=False).head(10).index
-    top_10_df = item_chan_summary[item_chan_summary['title'].isin(top_10_titles)]
-    
-    fig_items = px.bar(top_10_df, x=metric, y='title', color='channel', orientation='h', barmode='stack')
-    fig_items.update_layout(yaxis={'categoryorder':'total ascending'})
-    st.plotly_chart(fig_items, use_container_width=True)
+    # B. Mfg Date Detail Chart
+    st.subheader(f"{view_mode} by Manufacturing Date")
+    mfg_summary = data_filtered.groupby('mfg_date')[metric].sum().reset_index()
+    fig_mfg = px.bar(mfg_summary, x='mfg_date', y=metric, color_discrete_sequence=['#9b59b6'])
+    st.plotly_chart(fig_mfg, use_container_width=True)
 
 with c2:
-    # C. Pie Chart (Latest Upload)
-    latest_upload = data_filtered['date'].max()
-    st.subheader(f"Shelf Life Status (As on {latest_upload})")
-    latest_data = data_filtered[data_filtered['date'] == latest_upload]
-    fig_pie = px.pie(latest_data, values=metric, names='ageing_bucket', hole=0.5,
+    # C. Pie Chart
+    st.subheader(f"Shelf Life Status")
+    fig_pie = px.pie(data_filtered, values=metric, names='ageing_bucket', hole=0.5,
                      color='ageing_bucket',
                      color_discrete_map={">80% shelf life":"#27ae60", "60-80% shelf life":"#2980b9", 
                                          "40-60% shelf life":"#f39c12", "<40% shelf life":"#e74c3c"})
@@ -150,10 +143,9 @@ with c2:
 
 # --- 8. DETAILED DATA VIEW ---
 st.divider()
-st.subheader("📋 Detailed Data (By Batch & Quantity)")
-# Ensuring quantity as per manufacturing date is visible
-display_cols = ['date', 'channel', 'title', 'mfg_date', 'stock', 'ageing_bucket', 'Cost', 'Value']
-st.dataframe(data_filtered[display_cols].rename(columns={'stock': 'Quantity', 'mfg_date': 'Manufacturing Date'}), use_container_width=True)
+st.subheader("📋 Batch-wise Quantity Details")
+display_cols = ['channel', 'title', 'mfg_date', 'stock', 'ageing_bucket', 'Cost', 'Value']
+st.dataframe(data_filtered[display_cols].rename(columns={'stock': 'Quantity in Batch'}), use_container_width=True)
 
 # --- 9. ADMIN SETTINGS ---
 if st.session_state.auth == "Admin":
@@ -167,8 +159,8 @@ if st.session_state.auth == "Admin":
             new_prices = {}
             for t in all_titles_admin:
                 current_p = prices_dict.get(t, 0.0)
-                new_prices[t] = st.number_input(f"Cost Price: {t}", value=float(current_p), step=0.1)
-            if st.form_submit_button("Save All Prices"):
+                new_prices[t] = st.number_input(f"Price: {t}", value=float(current_p))
+            if st.form_submit_button("Save Prices"):
                 for title, price in new_prices.items():
                     c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (title, price))
                 conn.commit()
