@@ -4,136 +4,178 @@ import plotly.express as px
 import sqlite3
 from datetime import datetime, timedelta
 
-# --- DATABASE SETUP ---
-conn = sqlite3.connect('inventory_data.db', check_same_thread=False)
+# --- 1. DATABASE ENGINE ---
+# This creates a file called 'inventory_master.db' in your folder. 
+# It saves your data even if the app or computer restarts.
+conn = sqlite3.connect('inventory_master.db', check_same_thread=False)
 c = conn.cursor()
 
-# Create tables if they don't exist
 c.execute('''CREATE TABLE IF NOT EXISTS inventory 
              (date TEXT, channel TEXT, sku TEXT, title TEXT, stock REAL, mfg_date TEXT, shelf_life_pct REAL, ageing_bucket TEXT)''')
 c.execute('''CREATE TABLE IF NOT EXISTS prices 
              (title TEXT PRIMARY KEY, cost_price REAL)''')
 conn.commit()
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Inventory Master", layout="wide")
+# --- 2. APP SETTINGS ---
+st.set_page_config(page_title="Inventory Master Dashboard", layout="wide")
 
-# --- LOGIN SYSTEM ---
+# --- 3. LOGIN SYSTEM ---
 if 'auth' not in st.session_state:
     st.session_state.auth = None
 
 if st.session_state.auth is None:
     st.title("🔐 Inventory System Login")
-    user = st.selectbox("Select User", ["Viewer", "Admin"])
-    pwd = st.text_input("Enter Password", type="password")
-    if st.button("Login"):
-        if (user == "Admin" and pwd == "admin123") or (user == "Viewer" and pwd == "view123"):
-            st.session_state.auth = user
-            st.rerun()
-        else:
-            st.error("Incorrect Password")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        user = st.selectbox("Select User Role", ["Viewer", "Admin"])
+        pwd = st.text_input("Enter Password", type="password")
+        if st.button("Login"):
+            if (user == "Admin" and pwd == "admin123") or (user == "Viewer" and pwd == "view123"):
+                st.session_state.auth = user
+                st.rerun()
+            else:
+                st.error("Incorrect Password. (Hint: admin123 / view123)")
     st.stop()
 
-# --- LOGOUT BUTTON ---
+# --- 4. SIDEBAR LOGOUT & UPLOAD ---
+st.sidebar.title(f"👤 {st.session_state.auth} Mode")
 if st.sidebar.button("Logout"):
     st.session_state.auth = None
     st.rerun()
 
-# --- ADMIN FUNCTIONS ---
 if st.session_state.auth == "Admin":
-    with st.sidebar.expander("📤 Upload New WMS Report"):
-        u_date = st.date_input("Snapshot Date", datetime.now())
-        u_chan = st.selectbox("Channel", ["B2B", "B2C"])
-        u_file = st.file_uploader("Upload CSV", type="csv")
-        
-        if u_file and st.button("Save to Database"):
+    st.sidebar.divider()
+    st.sidebar.header("📤 Upload Snapshot")
+    u_date = st.sidebar.date_input("Select Date", datetime.now())
+    u_chan = st.sidebar.selectbox("Select Channel", ["B2B", "B2C"])
+    u_file = st.sidebar.file_uploader("Choose WMS CSV file", type="csv")
+    
+    if u_file and st.sidebar.button("Process & Save Snapshot"):
+        try:
             df = pd.read_csv(u_file)
-            # Logic to calculate ageing
+            # Standardizing Shelf Life calculation
             df['Shelf_Pct'] = pd.to_numeric(df['Shelf Life'].str.replace('%',''), errors='coerce').fillna(0)
+            
             def get_bucket(p):
                 if p > 80: return ">80% shelf life"
                 if p >= 60: return "60-80% shelf life"
                 if p >= 40: return "40-60% shelf life"
                 return "<40% shelf life"
+            
             df['Bucket'] = df['Shelf_Pct'].apply(get_bucket)
             
-            # Save to SQL
+            # Remove old data for this specific date/channel to avoid duplicates
+            c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (u_date.strftime('%Y-%m-%d'), u_chan))
+            
+            # Save new data
             for _, row in df.iterrows():
                 c.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?,?,?)", 
                           (u_date.strftime('%Y-%m-%d'), u_chan, row['SKU'], row['Title'], row['Total Stock'], row['Mfg Date'], row['Shelf_Pct'], row['Bucket']))
             conn.commit()
-            st.success("Data Saved!")
+            st.sidebar.success(f"Successfully saved {u_chan} for {u_date}")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Error: {e}")
 
-# --- DATA RETRIEVAL ---
+# --- 5. DATA LOADING ---
 inv_df = pd.read_sql("SELECT * FROM inventory", conn)
 price_df = pd.read_sql("SELECT * FROM prices", conn)
 prices_dict = dict(zip(price_df.title, price_df.cost_price))
 
 if inv_df.empty:
-    st.info("No data in database. Admin needs to upload reports.")
+    st.info("👋 Welcome! Please log in as Admin and upload your first WMS CSV file to see the dashboard.")
     st.stop()
 
-# --- DASHBOARD LOGIC ---
-st.title(f"📊 Dashboard - Welcome {st.session_state.auth}")
+# --- 6. FILTERS & LOGIC ---
+st.title("📊 Inventory Health & Valuation")
 
-# Time Filters
-st.subheader("📅 Time Filters")
-t_col1, t_col2, t_col3, t_col4 = st.columns(4)
-today = datetime.now()
-start_date = datetime(2000, 1, 1).date()
+# Time Filter Row
+t1, t2, t3, t4 = st.columns(4)
+today = datetime.now().date()
+filtered_start_date = datetime(2000, 1, 1).date()
 
-if t_col1.button("Last 7 Days"): start_date = (today - timedelta(days=7)).date()
-if t_col2.button("MTD (Month to Date)"): start_date = today.replace(day=1).date()
-if t_col3.button("Last 30 Days"): start_date = (today - timedelta(days=30)).date()
-if t_col4.button("Show All Time"): start_date = datetime(2000, 1, 1).date()
+if t1.button("Last 7 Days", use_container_width=True): filtered_start_date = today - timedelta(days=7)
+if t2.button("MTD (Month to Date)", use_container_width=True): filtered_start_date = today.replace(day=1)
+if t3.button("Last 30 Days", use_container_width=True): filtered_start_date = today - timedelta(days=30)
+if t4.button("Show All History", use_container_width=True): filtered_start_date = datetime(2000, 1, 1).date()
 
-# Apply logic filters
+# Apply Filtering
 inv_df['date'] = pd.to_datetime(inv_df['date']).dt.date
-filtered_df = inv_df[inv_df['date'] >= start_date]
+filtered_df = inv_df[inv_df['date'] >= filtered_start_date]
 filtered_df['Cost'] = filtered_df['title'].map(prices_dict).fillna(0)
 filtered_df['Value'] = filtered_df['stock'] * filtered_df['Cost']
 
-# --- VIEW TOGGLE ---
-view_mode = st.radio("Show Analysis By:", ["Quantity", "Value"], horizontal=True)
-metric_col = 'stock' if view_mode == "Quantity" else 'Value'
+# View Toggle
+view_mode = st.radio("Display Data By:", ["Quantity (Units)", "Value (Rupees)"], horizontal=True)
+metric = 'stock' if "Quantity" in view_mode else 'Value'
+unit_label = "Units" if "Quantity" in view_mode else "₹"
 
-# --- GRAPHS ---
-# 1. Bar Chart: Date vs Metric
-st.subheader(f"Inventory {view_mode} Trend by Date")
-date_summary = filtered_df.groupby('date')[metric_col].sum().reset_index()
-fig1 = px.bar(date_summary, x='date', y=metric_col, color_discrete_sequence=['#3366cc'])
-st.plotly_chart(fig1, use_container_width=True)
+# --- 7. CHARTS ---
+# A. Trend Bar Chart
+st.subheader(f"Inventory {view_mode} Trend")
+date_summary = filtered_df.groupby(['date', 'channel'])[metric].sum().reset_index()
+fig_trend = px.bar(date_summary, x='date', y=metric, color='channel', barmode='group',
+                   labels={metric: view_mode, 'date': 'Snapshot Date'})
+st.plotly_chart(fig_trend, use_container_width=True)
 
-col_a, col_b = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col_a:
-    # 2. Bar Chart: Item vs Metric
-    st.subheader(f"Top 10 Items by {view_mode}")
-    item_summary = filtered_df.groupby('title')[metric_col].sum().sort_values(ascending=False).head(10).reset_index()
-    fig2 = px.bar(item_summary, x=metric_col, y='title', orientation='h', color_discrete_sequence=['#109618'])
-    st.plotly_chart(fig2, use_container_width=True)
+with c1:
+    # B. Item Breakdown
+    st.subheader(f"Top Items by {view_mode}")
+    item_summary = filtered_df.groupby('title')[metric].sum().sort_values(ascending=False).head(10).reset_index()
+    fig_items = px.bar(item_summary, x=metric, y='title', orientation='h', 
+                       color_discrete_sequence=['#2ecc71'])
+    fig_items.update_layout(yaxis={'categoryorder':'total ascending'})
+    st.plotly_chart(fig_items, use_container_width=True)
 
-with col_b:
-    # 3. Pie Chart: Shelf Life
-    latest_date = inv_df['date'].max()
-    st.subheader(f"Shelf Life Status (as on {latest_date})")
-    latest_data = filtered_df[filtered_df['date'] == latest_date]
-    fig3 = px.pie(latest_data, values=metric_col, names='ageing_bucket', hole=0.4,
-                 color='ageing_bucket', color_discrete_map={">80% shelf life":"green","60-80% shelf life":"blue","40-60% shelf life":"orange","<40% shelf life":"red"})
-    st.plotly_chart(fig3, use_container_width=True)
+with c2:
+    # C. Shelf Life Pie Chart
+    latest_upload = inv_df['date'].max()
+    st.subheader(f"Shelf Life Status (As on {latest_upload})")
+    latest_data = filtered_df[filtered_df['date'] == latest_upload]
+    fig_pie = px.pie(latest_data, values=metric, names='ageing_bucket', hole=0.5,
+                     color='ageing_bucket',
+                     color_discrete_map={">80% shelf life":"#27ae60", "60-80% shelf life":"#2980b9", 
+                                         "40-60% shelf life":"#f39c12", "<40% shelf life":"#e74c3c"})
+    st.plotly_chart(fig_pie, use_container_width=True)
 
-# --- DATA DOWNLOAD & PRICE EDIT ---
+# --- 8. DATA TABLE & DOWNLOAD ---
 st.divider()
-if st.session_state.auth == "Admin":
-    st.subheader("💰 Edit Cost Prices")
-    all_titles = inv_df['title'].unique()
-    for t in all_titles:
-        new_p = st.number_input(f"Price for {t}", value=prices_dict.get(t, 0.0), key=t)
-        if st.button(f"Update Price for {t[:20]}..."):
-            c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (t, new_p))
-            conn.commit()
-            st.success("Price Updated!")
+st.subheader("📋 Detailed Data View")
+st.dataframe(filtered_df[['date', 'channel', 'title', 'stock', 'ageing_bucket', 'Cost', 'Value']], use_container_width=True)
 
-st.subheader("📥 Download Snapshot Data")
-csv = filtered_df.to_csv(index=False).encode('utf-8')
-st.download_button("Download Current View as CSV", csv, "inventory_report.csv", "text/csv")
+csv_data = filtered_df.to_csv(index=False).encode('utf-8')
+st.download_button("📥 Download This View (CSV)", csv_data, f"Inventory_Report_{today}.csv", "text/csv")
+
+# --- 9. ADMIN SETTINGS (BOTTOM) ---
+if st.session_state.auth == "Admin":
+    st.divider()
+    st.header("⚙️ Admin Configuration")
+    
+    t_price, t_del = st.tabs(["💰 Update Cost Prices", "🗑️ Manage Snapshots"])
+    
+    with t_price:
+        st.info("New items appear here automatically. Set a price to update the 'Value' dashboard.")
+        all_titles = sorted(inv_df['title'].unique())
+        with st.form("master_price_form"):
+            new_prices = {}
+            for t in all_titles:
+                current_p = prices_dict.get(t, 0.0)
+                new_prices[t] = st.number_input(f"Cost Price: {t}", value=float(current_p), step=0.1)
+            
+            if st.form_submit_button("Save All Prices"):
+                for title, price in new_prices.items():
+                    c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (title, price))
+                conn.commit()
+                st.success("Prices saved successfully!")
+                st.rerun()
+
+    with t_del:
+        st.warning("Deleting a snapshot is permanent.")
+        snaps = inv_df[['date', 'channel']].drop_duplicates()
+        for i, row in snaps.iterrows():
+            if st.button(f"Delete {row['channel']} - {row['date']}", key=f"del_{i}"):
+                c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (str(row['date']), row['channel']))
+                conn.commit()
+                st.rerun()
