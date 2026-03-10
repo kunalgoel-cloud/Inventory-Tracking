@@ -66,7 +66,7 @@ if st.session_state.auth == "Admin":
         except Exception as e:
             st.sidebar.error(f"Error: {e}")
 
-# --- 5. DATA LOADING ---
+# --- 5. DATA LOADING & SORTING ---
 inv_df = pd.read_sql("SELECT * FROM inventory", conn)
 price_df = pd.read_sql("SELECT * FROM prices", conn)
 prices_dict = dict(zip(price_df.title, price_df.cost_price))
@@ -75,6 +75,7 @@ if inv_df.empty:
     st.info("👋 Welcome! Admin needs to upload a CSV file to begin.")
     st.stop()
 
+# Convert Snapshot and Mfg Dates to actual date objects for sorting
 inv_df['date'] = pd.to_datetime(inv_df['date']).dt.date
 inv_df['mfg_date_dt'] = pd.to_datetime(inv_df['mfg_date'], dayfirst=True, errors='coerce')
 inv_df['Mfg Month-Year'] = inv_df['mfg_date_dt'].dt.strftime('%b-%Y')
@@ -85,7 +86,6 @@ f_col1, f_col2, f_col3 = st.columns(3)
 
 with f_col1:
     view_date = st.selectbox("Snapshot Date", sorted(inv_df['date'].unique(), reverse=True))
-    # Base data for the selected day
     day_data = inv_df[inv_df['date'] == view_date].copy()
 
 with f_col2:
@@ -95,7 +95,8 @@ with f_col2:
         day_data = day_data[day_data['title'].isin(selected_items)]
 
 with f_col3:
-    available_mfg = sorted(day_data['Mfg Month-Year'].dropna().unique())
+    # Get Mfg periods and sort them chronologically
+    available_mfg = day_data.dropna(subset=['mfg_date_dt']).sort_values('mfg_date_dt')['Mfg Month-Year'].unique()
     selected_mfg = st.multiselect("Filter Mfg Period", options=available_mfg)
     if selected_mfg:
         day_data = day_data[day_data['Mfg Month-Year'].isin(selected_mfg)]
@@ -108,29 +109,25 @@ metric = 'stock' if "Quantity" in view_mode else 'Value'
 
 # --- 7. CHARTS ---
 
-# GRAPH 1: COMPANY TOTAL VIEW (Stacked Bar by Date)
+# GRAPH 1: COMPANY TOTAL VIEW
 st.subheader(f"Total Company {view_mode} History")
-# We pull history for the trend but apply product/mfg filters to it
 history_data = inv_df.copy()
 if selected_items: history_data = history_data[history_data['title'].isin(selected_items)]
 if selected_mfg: history_data = history_data[history_data['Mfg Month-Year'].isin(selected_mfg)]
 history_data['Cost'] = history_data['title'].map(prices_dict).fillna(0)
 history_data['Value'] = history_data['stock'] * history_data['Cost']
 
-company_trend = history_data.groupby(['date', 'channel'])[metric].sum().reset_index()
-fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack',
-                   title="Company-Wide Stock Trend (B2B vs B2C)")
+company_trend = history_data.groupby(['date', 'channel'])[metric].sum().reset_index().sort_values('date')
+fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack')
 st.plotly_chart(fig_trend, use_container_width=True)
 
-# GRAPH 2: ITEM WISE VIEW (Horizontal Bar)
+# GRAPH 2: ITEM WISE VIEW
 st.subheader(f"Item-Wise {view_mode} Breakdown (Snapshot: {view_date})")
 item_summary = day_data.groupby(['title', 'channel'])[metric].sum().reset_index()
 fig_items = px.bar(item_summary, x=metric, y='title', color='channel', 
                    orientation='h', barmode='stack', height=max(400, len(item_summary)*20))
-fig_items.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=True)
+fig_items.update_layout(yaxis={'categoryorder':'total ascending'})
 st.plotly_chart(fig_items, use_container_width=True)
-
-
 
 c1, c2 = st.columns(2)
 with c1:
@@ -142,9 +139,13 @@ with c1:
     st.plotly_chart(fig_pie, use_container_width=True)
 
 with c2:
-    st.subheader("Value by Mfg Date")
-    mfg_sum = day_data.groupby('mfg_date')[metric].sum().reset_index()
+    # FIXED: Chronological Bar Graph for Mfg Dates
+    st.subheader(f"{view_mode} by Manufacturing Date (Oldest to Newest)")
+    # Sort data by the hidden mfg_date_dt column to ensure left-to-right chronology
+    mfg_sum = day_data.groupby(['mfg_date', 'mfg_date_dt'])[metric].sum().reset_index().sort_values('mfg_date_dt')
     fig_mfg = px.bar(mfg_sum, x='mfg_date', y=metric, color_discrete_sequence=['#9b59b6'])
+    # Force the X-axis to follow our sorted order
+    fig_mfg.update_layout(xaxis={'categoryorder':'array', 'categoryarray': mfg_sum['mfg_date']})
     st.plotly_chart(fig_mfg, use_container_width=True)
 
 # --- 8. DETAILED DATA VIEW ---
