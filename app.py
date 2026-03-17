@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 # --- 1. DATABASE ENGINE ---
+# This creates/connects to the permanent database file
 conn = sqlite3.connect('inventory_master.db', check_same_thread=False)
 c = conn.cursor()
 
@@ -49,14 +50,19 @@ if st.session_state.auth == "Admin":
     if u_file and st.sidebar.button("Process & Save Snapshot"):
         try:
             df = pd.read_csv(u_file)
-            df['Shelf_Pct'] = pd.to_numeric(df['Shelf Life'].str.replace('%',''), errors='coerce').fillna(0)
+            # Clean shelf life percentage
+            df['Shelf_Pct'] = pd.to_numeric(df['Shelf Life'].astype(str).str.replace('%',''), errors='coerce').fillna(0)
+            
             def get_bucket(p):
                 if p > 80: return ">80% shelf life"
                 if p >= 60: return "60-80% shelf life"
                 if p >= 40: return "40-60% shelf life"
                 return "<40% shelf life"
             df['Bucket'] = df['Shelf_Pct'].apply(get_bucket)
+            
+            # Remove existing data for this date/channel to prevent duplicates on refresh
             c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (u_date.strftime('%Y-%m-%d'), u_chan))
+            
             for _, row in df.iterrows():
                 c.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?,?,?)", 
                           (u_date.strftime('%Y-%m-%d'), u_chan, row['SKU'], row['Title'], row['Total Stock'], row['Mfg Date'], row['Shelf_Pct'], row['Bucket']))
@@ -64,18 +70,21 @@ if st.session_state.auth == "Admin":
             st.sidebar.success(f"Saved {u_chan} for {u_date}")
             st.rerun()
         except Exception as e:
-            st.sidebar.error(f"Error: {e}")
+            st.sidebar.error(f"Error processing file: {e}")
 
 # --- 5. DATA LOADING ---
+# This pulls the persistent data from the database file
 inv_df = pd.read_sql("SELECT * FROM inventory", conn)
 price_df = pd.read_sql("SELECT * FROM prices", conn)
 prices_dict = dict(zip(price_df.title, price_df.cost_price))
 
 if inv_df.empty:
-    st.info("👋 Welcome! Admin needs to upload a CSV file to begin.")
+    st.info("👋 No data found. Please log in as Admin and upload a CSV file to begin.")
     st.stop()
 
+# Data Cleaning for UI
 inv_df['date'] = pd.to_datetime(inv_df['date']).dt.date
+# Clean Mfg Date for sorting (Handling potential erratic strings)
 inv_df['mfg_date_dt'] = pd.to_datetime(inv_df['mfg_date'], dayfirst=True, errors='coerce')
 inv_df['Mfg Month-Year'] = inv_df['mfg_date_dt'].dt.strftime('%b-%Y')
 
@@ -91,7 +100,7 @@ with m1:
 with m2:
     st.metric(label="Total Stock Quantity", value=f"{int(latest_summary_df['stock'].sum()):,}")
 with m3:
-    st.metric(label="Latest Upload Date", value=latest_date.strftime('%d-%b-%Y'))
+    st.metric(label="Data As On", value=latest_date.strftime('%d-%b-%Y'))
 
 st.divider()
 
@@ -100,7 +109,7 @@ st.subheader("🔍 Deep Dive Filters")
 f_col1, f_col2, f_col3 = st.columns(3)
 
 with f_col1:
-    view_date = st.selectbox("View Historical Snapshot", sorted(inv_df['date'].unique(), reverse=True))
+    view_date = st.selectbox("Snapshot Date", sorted(inv_df['date'].unique(), reverse=True))
     day_data = inv_df[inv_df['date'] == view_date].copy()
 
 with f_col2:
@@ -110,6 +119,7 @@ with f_col2:
         day_data = day_data[day_data['title'].isin(selected_items)]
 
 with f_col3:
+    # Sort Mfg periods chronologically
     available_mfg = day_data.dropna(subset=['mfg_date_dt']).sort_values('mfg_date_dt')['Mfg Month-Year'].unique()
     selected_mfg = st.multiselect("Filter Mfg Period", options=available_mfg)
     if selected_mfg:
@@ -118,31 +128,32 @@ with f_col3:
 day_data['Cost'] = day_data['title'].map(prices_dict).fillna(0)
 day_data['Value'] = day_data['stock'] * day_data['Cost']
 
-view_mode = st.radio("Metric:", ["Quantity (Units)", "Value (Rupees)"], horizontal=True)
+view_mode = st.radio("Display Metric:", ["Quantity (Units)", "Value (Rupees)"], horizontal=True)
 metric = 'stock' if "Quantity" in view_mode else 'Value'
 
 # --- 8. CHARTS ---
 
-# GRAPH 1: COMPANY TOTAL VIEW
-st.subheader(f"Company {view_mode} History")
+# GRAPH 1: COMPANY TOTAL VIEW (Trend)
+st.subheader(f"Company {view_mode} History Trend")
 history_data = inv_df.copy()
+# Apply filters to history as well for consistency
 if selected_items: history_data = history_data[history_data['title'].isin(selected_items)]
 if selected_mfg: history_data = history_data[history_data['Mfg Month-Year'].isin(selected_mfg)]
+
 history_data['Cost'] = history_data['title'].map(prices_dict).fillna(0)
 history_data['Value'] = history_data['stock'] * history_data['Cost']
 company_trend = history_data.groupby(['date', 'channel'])[metric].sum().reset_index().sort_values('date')
-fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack')
+
+fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack', color_discrete_map={'B2B': '#3498db', 'B2C': '#e67e22'})
 st.plotly_chart(fig_trend, use_container_width=True)
 
-# GRAPH 2: ITEM WISE VIEW
-st.subheader(f"Item-Wise Breakdown (Snapshot: {view_date})")
+# GRAPH 2: ITEM WISE VIEW (Horizontal)
+st.subheader(f"Item-Wise Breakdown for {view_date}")
 item_summary = day_data.groupby(['title', 'channel'])[metric].sum().reset_index()
 fig_items = px.bar(item_summary, x=metric, y='title', color='channel', 
-                   orientation='h', barmode='stack', height=max(400, len(item_summary)*20))
+                   orientation='h', barmode='stack', height=max(400, len(item_summary)*25))
 fig_items.update_layout(yaxis={'categoryorder':'total ascending'})
 st.plotly_chart(fig_items, use_container_width=True)
-
-
 
 c1, c2 = st.columns(2)
 with c1:
@@ -162,27 +173,36 @@ with c2:
 
 # --- 9. DETAILED DATA VIEW ---
 st.divider()
-st.subheader("📋 Detailed Batch View")
+st.subheader("📋 Detailed Snapshot Data")
 st.dataframe(day_data[['channel', 'title', 'mfg_date', 'stock', 'ageing_bucket', 'Value']].rename(columns={'stock': 'Qty'}), use_container_width=True)
 
 # --- 10. ADMIN PANEL ---
 if st.session_state.auth == "Admin":
     st.divider()
-    st.header("⚙️ Admin Panel")
-    t_price, t_del = st.tabs(["💰 Prices", "🗑️ Snapshots"])
+    st.header("⚙️ Admin Controls")
+    t_price, t_del = st.tabs(["💰 Manage Prices", "🗑️ Manage History"])
+    
     with t_price:
+        st.write("Update item cost prices below. Click 'Save Prices' to update the dashboard.")
         with st.form("p_form"):
-            new_ps = {t: st.number_input(f"Price: {t}", value=float(prices_dict.get(t,0.0))) for t in sorted(inv_df['title'].unique())}
+            unique_titles = sorted(inv_df['title'].unique())
+            new_ps = {}
+            for t in unique_titles:
+                current_p = prices_dict.get(t, 0.0)
+                new_ps[t] = st.number_input(f"Cost Price: {t}", value=float(current_p))
             if st.form_submit_button("Save Prices"):
                 for title, price in new_ps.items():
                     c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (title, price))
                 conn.commit()
-                st.success("Prices Updated!")
+                st.success("Prices successfully updated in database!")
                 st.rerun()
+
     with t_del:
+        st.write("Delete specific snapshots from the database history.")
         snaps = inv_df[['date', 'channel']].drop_duplicates()
         for i, row in snaps.iterrows():
-            if st.button(f"Delete {row['channel']} - {row['date']}", key=f"del_{i}"):
+            if st.button(f"🗑️ Delete {row['channel']} - {row['date']}", key=f"del_{i}"):
                 c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (str(row['date']), row['channel']))
                 conn.commit()
+                st.warning(f"Deleted {row['channel']} snapshot for {row['date']}")
                 st.rerun()
