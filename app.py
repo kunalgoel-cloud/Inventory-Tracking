@@ -3,17 +3,34 @@ import pandas as pd
 import plotly.express as px
 import sqlite3
 from datetime import datetime, timedelta
+import os
 
-# --- 1. DATABASE ENGINE ---
-# This creates/connects to the permanent database file
-conn = sqlite3.connect('inventory_master.db', check_same_thread=False)
+# --- 1. DATABASE ENGINE (IMPROVED) ---
+# Use absolute path to ensure database persistence
+DB_PATH = os.path.join(os.getcwd(), 'inventory_master.db')
+
+@st.cache_resource
+def get_db_connection():
+    """Create a cached database connection that persists across reruns"""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
+def init_database():
+    """Initialize database tables if they don't exist"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS inventory 
+                 (date TEXT, channel TEXT, sku TEXT, title TEXT, stock REAL, 
+                  mfg_date TEXT, shelf_life_pct REAL, ageing_bucket TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS prices 
+                 (title TEXT PRIMARY KEY, cost_price REAL)''')
+    conn.commit()
+    return conn
+
+# Initialize database
+conn = init_database()
 c = conn.cursor()
-
-c.execute('''CREATE TABLE IF NOT EXISTS inventory 
-             (date TEXT, channel TEXT, sku TEXT, title TEXT, stock REAL, mfg_date TEXT, shelf_life_pct REAL, ageing_bucket TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS prices 
-             (title TEXT PRIMARY KEY, cost_price REAL)''')
-conn.commit()
 
 # --- 2. APP SETTINGS ---
 st.set_page_config(page_title="Inventory Master Dashboard", layout="wide")
@@ -60,22 +77,36 @@ if st.session_state.auth == "Admin":
                 return "<40% shelf life"
             df['Bucket'] = df['Shelf_Pct'].apply(get_bucket)
             
-            # Remove existing data for this date/channel to prevent duplicates on refresh
+            # Remove existing data for this date/channel to prevent duplicates
             c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (u_date.strftime('%Y-%m-%d'), u_chan))
+            conn.commit()  # Commit deletion first
             
+            # Insert new data
             for _, row in df.iterrows():
                 c.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?,?,?)", 
-                          (u_date.strftime('%Y-%m-%d'), u_chan, row['SKU'], row['Title'], row['Total Stock'], row['Mfg Date'], row['Shelf_Pct'], row['Bucket']))
-            conn.commit()
-            st.sidebar.success(f"Saved {u_chan} for {u_date}")
+                          (u_date.strftime('%Y-%m-%d'), u_chan, row['SKU'], row['Title'], 
+                           row['Total Stock'], row['Mfg Date'], row['Shelf_Pct'], row['Bucket']))
+            
+            conn.commit()  # Commit all inserts
+            st.sidebar.success(f"✅ Saved {u_chan} for {u_date}")
             st.rerun()
         except Exception as e:
-            st.sidebar.error(f"Error processing file: {e}")
+            st.sidebar.error(f"❌ Error processing file: {e}")
+            conn.rollback()  # Rollback on error
 
 # --- 5. DATA LOADING ---
-# This pulls the persistent data from the database file
-inv_df = pd.read_sql("SELECT * FROM inventory", conn)
-price_df = pd.read_sql("SELECT * FROM prices", conn)
+@st.cache_data(ttl=1)  # Cache for 1 second to allow updates
+def load_inventory_data():
+    """Load inventory data from database with caching"""
+    return pd.read_sql("SELECT * FROM inventory", conn)
+
+@st.cache_data(ttl=1)  # Cache for 1 second to allow updates
+def load_price_data():
+    """Load price data from database with caching"""
+    return pd.read_sql("SELECT * FROM prices", conn)
+
+inv_df = load_inventory_data()
+price_df = load_price_data()
 prices_dict = dict(zip(price_df.title, price_df.cost_price))
 
 if inv_df.empty:
@@ -144,7 +175,8 @@ history_data['Cost'] = history_data['title'].map(prices_dict).fillna(0)
 history_data['Value'] = history_data['stock'] * history_data['Cost']
 company_trend = history_data.groupby(['date', 'channel'])[metric].sum().reset_index().sort_values('date')
 
-fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack', color_discrete_map={'B2B': '#3498db', 'B2C': '#e67e22'})
+fig_trend = px.bar(company_trend, x='date', y=metric, color='channel', barmode='stack', 
+                   color_discrete_map={'B2B': '#3498db', 'B2C': '#e67e22'})
 st.plotly_chart(fig_trend, use_container_width=True)
 
 # GRAPH 2: ITEM WISE VIEW (Horizontal)
@@ -174,7 +206,8 @@ with c2:
 # --- 9. DETAILED DATA VIEW ---
 st.divider()
 st.subheader("📋 Detailed Snapshot Data")
-st.dataframe(day_data[['channel', 'title', 'mfg_date', 'stock', 'ageing_bucket', 'Value']].rename(columns={'stock': 'Qty'}), use_container_width=True)
+st.dataframe(day_data[['channel', 'title', 'mfg_date', 'stock', 'ageing_bucket', 'Value']].rename(columns={'stock': 'Qty'}), 
+             use_container_width=True)
 
 # --- 10. ADMIN PANEL ---
 if st.session_state.auth == "Admin":
@@ -191,18 +224,40 @@ if st.session_state.auth == "Admin":
                 current_p = prices_dict.get(t, 0.0)
                 new_ps[t] = st.number_input(f"Cost Price: {t}", value=float(current_p))
             if st.form_submit_button("Save Prices"):
-                for title, price in new_ps.items():
-                    c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (title, price))
-                conn.commit()
-                st.success("Prices successfully updated in database!")
-                st.rerun()
+                try:
+                    for title, price in new_ps.items():
+                        c.execute("INSERT OR REPLACE INTO prices (title, cost_price) VALUES (?, ?)", (title, price))
+                    conn.commit()  # Commit all price updates
+                    st.success("✅ Prices successfully updated in database!")
+                    # Clear cache to force reload
+                    load_price_data.clear()
+                    load_inventory_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error updating prices: {e}")
+                    conn.rollback()
 
     with t_del:
         st.write("Delete specific snapshots from the database history.")
         snaps = inv_df[['date', 'channel']].drop_duplicates()
         for i, row in snaps.iterrows():
             if st.button(f"🗑️ Delete {row['channel']} - {row['date']}", key=f"del_{i}"):
-                c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (str(row['date']), row['channel']))
-                conn.commit()
-                st.warning(f"Deleted {row['channel']} snapshot for {row['date']}")
-                st.rerun()
+                try:
+                    c.execute("DELETE FROM inventory WHERE date=? AND channel=?", (str(row['date']), row['channel']))
+                    conn.commit()  # Commit deletion
+                    st.warning(f"⚠️ Deleted {row['channel']} snapshot for {row['date']}")
+                    # Clear cache to force reload
+                    load_inventory_data.clear()
+                    load_price_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error deleting snapshot: {e}")
+                    conn.rollback()
+
+# Display database location for reference
+if st.session_state.auth == "Admin":
+    with st.expander("ℹ️ Database Information"):
+        st.info(f"**Database Location:** `{DB_PATH}`")
+        st.info(f"**Database exists:** {os.path.exists(DB_PATH)}")
+        if os.path.exists(DB_PATH):
+            st.info(f"**Database size:** {os.path.getsize(DB_PATH):,} bytes")
