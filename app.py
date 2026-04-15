@@ -110,9 +110,12 @@ init_database()
 def load_inventory_data():
     """Load all inventory data from PostgreSQL"""
     try:
-        query = "SELECT date, channel, sku, title, stock, mfg_date, shelf_life_pct, ageing_bucket FROM inventory ORDER BY date DESC"
-        df = pd.read_sql(query, conn)
-        return df
+        cur = conn.cursor()
+        cur.execute("SELECT date, channel, sku, title, stock, mfg_date, shelf_life_pct, ageing_bucket FROM inventory ORDER BY date DESC")
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description]
+        cur.close()
+        return pd.DataFrame(rows, columns=cols)
     except Exception as e:
         st.error(f"Error loading inventory: {e}")
         return pd.DataFrame()
@@ -121,9 +124,12 @@ def load_inventory_data():
 def load_price_data():
     """Load all price data from PostgreSQL"""
     try:
-        query = "SELECT title, cost_price FROM prices"
-        df = pd.read_sql(query, conn)
-        return df
+        cur = conn.cursor()
+        cur.execute("SELECT title, cost_price FROM prices")
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description]
+        cur.close()
+        return pd.DataFrame(rows, columns=cols)
     except Exception as e:
         st.error(f"Error loading prices: {e}")
         return pd.DataFrame()
